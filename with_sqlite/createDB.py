@@ -1,19 +1,17 @@
 from sqlalchemy import create_engine
-from sqlalchemy.sql import text
 import pandas as pd
 import os
-import sqlite3
-from mappings import column_mappings, position_mapping
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.sql import text
 
 
 def database_exists(database_url: str) -> bool:
     """
     Check if the database file exists.
 
-    :param database_url: SQLite database URL (e.g., sqlite:///restaurant.db).
+    :param database_url: SQLite database URL.
     :return: True if the database file exists, False otherwise.
     """
-    # Extract the SQLite file path from the URL
     if database_url.startswith("sqlite:///"):
         db_file = database_url.replace("sqlite:///", "")
         return os.path.exists(db_file)
@@ -22,24 +20,19 @@ def database_exists(database_url: str) -> bool:
 
 def apply_sql_script(database_url: str, script_path: str):
     """
-    Apply a given SQL script to the database.
+    Applies an SQL script to initialize the database.
 
-    :param database_url: SQLite database URL (e.g., sqlite:///restaurant.db).
+    :param database_url: SQLite database URL.
     :param script_path: Path to the SQL script to execute.
     """
-    # Create a database engine
     engine = create_engine(database_url)
 
     try:
-        # Read the SQL script
         with open(script_path, "r") as file:
             sql_script = file.read()
 
-        # Apply the SQL script using executescript
         with engine.connect() as connection:
-            connection.connection.executescript(
-                sql_script
-            )  # Use executescript for multi-statement SQL
+            connection.connection.executescript(sql_script)
 
         print("Applied SQL script successfully.")
     except Exception as e:
@@ -48,12 +41,11 @@ def apply_sql_script(database_url: str, script_path: str):
 
 def initialize_database(database_url: str, up_script_path: str):
     """
-    Initialize the database using the provided up.sql script.
+    Initialize the database using the provided SQL script.
 
-    :param database_url: SQLite database URL (e.g., sqlite:///restaurant.db).
-    :param up_script_path: Path to the SQL script that creates the schema.
+    :param database_url: SQLite database URL.
+    :param up_script_path: Path to the SQL schema script.
     """
-    # Check if the database already exists
     if not database_exists(database_url):
         print("Database does not exist. Creating database and applying schema...")
         apply_sql_script(database_url, up_script_path)
@@ -61,116 +53,278 @@ def initialize_database(database_url: str, up_script_path: str):
         print("Database already exists. Skipping schema creation.")
 
 
-def populate_database(database_url: str, excel_file_path: str):
+def get_restaurant_id(engine, restaurant_name):
     """
-    Populate the database with data from an Excel file.
+    Get the restaurant_id from the `restaurant` table based on the restaurant name.
 
-    :param database_url: SQLite database URL (e.g., sqlite:///restaurant.db).
-    :param excel_file_path: Path to the Excel file containing the data to populate the database.
+    :param engine: SQLAlchemy engine.
+    :param restaurant_name: Name of the restaurant.
+    :return: The corresponding restaurant_id.
     """
-    # Create a database engine
+    query = text("SELECT restaurant_id FROM restaurant WHERE name=:name")
+    with engine.connect() as conn:
+        result = conn.execute(query, {"name": restaurant_name}).fetchone()
+    return result[0] if result else None
+
+
+def populate_database(database_url: str, excel_file_path: str):
     engine = create_engine(database_url)
 
-    # Load Excel data
-    data = pd.ExcelFile(excel_file_path)
+    try:
+        data = pd.read_excel(excel_file_path, sheet_name=None)  # Load all sheets
 
-    # Menu table for Chez Martin
-    menu_chez_martin_df = data.parse(sheet_name="menu_chez_martin")
-    # Rename the French columns using mappings
-    menu_chez_martin_df.rename(
-        columns=column_mappings["menu_chez_martin"], inplace=True
-    )
-    # Insert data
-    menu_chez_martin_df.to_sql(
-        "menu_chez_martin", con=engine, if_exists="append", index=False
-    )
+        ### Populate `restaurant` table
+        restaurant_df = data["restaurant"]
+        restaurant_df.rename(
+            columns={"Nom": "name", "Adresse": "address"}, inplace=True
+        )
+        restaurant_df.to_sql("restaurant", con=engine, if_exists="append", index=False)
 
-    # Employee table
-    employee_df = data.parse(sheet_name="employé")
-    # Rename the French columns using mappings
-    employee_df.rename(columns=column_mappings["employé"], inplace=True)
+        ### Populate `dish` table
+        for sheet_name, restaurant_name in [
+            ("menu_le_gourmet", "Le Gourmet"),
+            ("menu_la_bonne_table", "La Bonne Table"),
+            ("menu_chez_martin", "Chez Martin"),
+        ]:
+            if sheet_name in data:
+                restaurant_id = get_restaurant_id(engine, restaurant_name)
+                df = data[sheet_name]
+                df["restaurant_id"] = restaurant_id
+                df.rename(columns={"Nom": "name", "Prix": "price"}, inplace=True)
+                df[["restaurant_id", "name", "price"]].to_sql(
+                    "dish", con=engine, if_exists="append", index=False
+                )
 
-    # Apply position mapping
-    employee_df["position"] = employee_df["position"].map(position_mapping)
+        ### Populate `client` table
+        for sheet_name, restaurant_name in [
+            ("client_le_gourmet", "Le Gourmet"),
+            ("client_la_bonne_table", "La Bonne Table"),
+            ("client_chez_martin", "Chez Martin"),
+        ]:
+            if sheet_name in data:
+                # Get `restaurant_id` for the current restaurant
+                restaurant_id = get_restaurant_id(engine, restaurant_name)
 
-    # Validate that all positions have been mapped
-    if employee_df["position"].isnull().any():
-        unmapped_positions = employee_df[employee_df["position"].isnull()]["position"]
-        raise ValueError(f"Unmapped positions found: {unmapped_positions.tolist()}")
+                # Load the data for the current sheet
+                df = data[sheet_name]
 
-    # Format `hiring_date` as YYYY-MM-DD
-    employee_df["hiring_date"] = pd.to_datetime(
-        employee_df["hiring_date"], errors="coerce"
-    ).dt.strftime("%Y-%m-%d")
+                # Strip any extra spaces from column names for safety
+                df.columns = df.columns.str.strip()
 
-    # Format `salary` as numeric (convert € to float)
-    employee_df["salary"] = (
-        employee_df["salary"]
-        .str.replace("€", "", regex=False)
-        .str.replace(",", ".", regex=False)
-        .astype(float)
-    )
+                # Debugging: Print the columns after cleaning
+                print(
+                    f"Processing sheet '{sheet_name}' with columns: {df.columns.tolist()}"
+                )
 
-    # Insert employee data
-    employee_df.to_sql("employee", con=engine, if_exists="append", index=False)
+                # Rename the columns to match the database schema
+                df.rename(
+                    columns={
+                        "Prénom": "first_name",
+                        "Nom": "last_name",
+                        "Email": "email",
+                        "Téléphone": "phone",
+                        "Date_Inscription": "inscription_date",
+                    },
+                    inplace=True,
+                )
 
-    # Supplier table
-    fournisseur_df = data.parse(sheet_name="fournisseur")
-    # Rename the French columns using mappings
-    fournisseur_df.rename(columns=column_mappings["fournisseur"], inplace=True)
-    # Insert data
-    fournisseur_df.to_sql("supplier", con=engine, if_exists="append", index=False)
+                # Debugging: Print the renamed columns to ensure renaming worked
+                print(f"Renamed columns for '{sheet_name}': {df.columns.tolist()}")
 
-    # Client tables
-    client_sheets = ["client_le_gourmet", "client_la_bonne_table", "client_chez_martin"]
-    for sheet_name in client_sheets:
-        client_df = data.parse(sheet_name=sheet_name)
-        # Rename the French columns using mappings
-        client_df.rename(columns=column_mappings["clients"], inplace=True)
+                # Add the `restaurant_id` column
+                df["restaurant_id"] = restaurant_id
 
-        # Format dates
-        client_df["inscription_date"] = pd.to_datetime(
-            client_df["inscription_date"], errors="coerce"
-        ).dt.strftime("%Y-%m-%d")
-        client_df["order_date"] = pd.to_datetime(
-            client_df["order_date"], errors="coerce"
-        ).dt.strftime("%Y-%m-%d")
+                # Define the relevant columns for the `client` table
+                client_columns = [
+                    "restaurant_id",
+                    "first_name",
+                    "last_name",
+                    "email",
+                    "phone",
+                    "inscription_date",
+                ]
 
-        # Insert data
-        table_name = f"client_{sheet_name.split('_')[-1]}"
-        client_df.to_sql(table_name, con=engine, if_exists="append", index=False)
+                # Check if all required columns exist after renaming
+                if all(col in df.columns for col in client_columns):
+                    # Write the relevant data to the `client` table
+                    df[client_columns].to_sql(
+                        "client", con=engine, if_exists="append", index=False
+                    )
+                    print(
+                        f"Successfully populated `client` table from sheet '{sheet_name}'."
+                    )
+                else:
+                    # If required columns are missing, print error information
+                    missing_cols = [
+                        col for col in client_columns if col not in df.columns
+                    ]
+                    print(f"Missing columns in sheet '{sheet_name}': {missing_cols}")
+                    raise ValueError(f"Missing columns: {missing_cols}")
 
-    # Stock tables
-    stock_sheets = ["stocks_le_gourmet", "stocks_la_bonne_table", "stocks_chez_martin"]
-    for sheet_name in stock_sheets:
-        stock_df = data.parse(sheet_name=sheet_name)
-        # Rename the French columns using mappings
-        stock_df.rename(columns=column_mappings["stocks"], inplace=True)
+        ### Populate `employee` table
+        if "employé" in data:
+            employee_df = data["employé"]
 
-        # Format `delivery_date` as YYYY-MM-DD
-        stock_df["delivery_date"] = pd.to_datetime(
-            stock_df["delivery_date"], errors="coerce"
-        ).dt.strftime("%Y-%m-%d")
-        # Insert data
-        stock_df.to_sql(sheet_name, con=engine, if_exists="append", index=False)
+            # Rename columns to match the database schema
+            employee_df.rename(
+                columns={
+                    "Prénom": "first_name",  # Correcting "Prénom" to "first_name"
+                    "Nom": "last_name",
+                    "Poste": "position",
+                    "Date_Embauche": "hiring_date",
+                    "Salaire": "salary",
+                    "Restaurant_ID": "restaurant_name",
+                },
+                inplace=True,
+            )
 
-    print("Database populated with data from the Excel file.")
+            # Translate French positions to English
+            position_translation = {
+                "Serveur": "WAITER",
+                "Cuisinier": "COOK",
+                "Plongeur": "DISHWASHER",
+                "Responsable": "MANAGER",
+                "Chef Cuisinier": "HEAD COOK",
+            }
+            employee_df["position"] = employee_df["position"].map(position_translation)
+
+            # Debugging: Check if all position translations were successful
+            print(f"Translated positions: {employee_df['position'].unique()}")
+
+            # Map the `restaurant_id` using `restaurant_name`
+            employee_df["restaurant_id"] = employee_df["restaurant_name"].apply(
+                lambda name: get_restaurant_id(engine, name)
+            )
+
+            # Select relevant columns for the `employee` table
+            employee_df = employee_df[
+                [
+                    "restaurant_id",
+                    "first_name",
+                    "last_name",
+                    "position",
+                    "hiring_date",
+                    "salary",
+                ]
+            ]
+
+            # Write the data to the `employee` table
+            employee_df.to_sql("employee", con=engine, if_exists="append", index=False)
+
+        ### Populate `order` table
+        for sheet_name, restaurant_name in [
+            ("client_le_gourmet", "Le Gourmet"),
+            ("client_la_bonne_table", "La Bonne Table"),
+            ("client_chez_martin", "Chez Martin"),
+        ]:
+            if sheet_name in data:
+                # Load the data for the current sheet
+                df = data[sheet_name]
+
+                # Strip any extra spaces from column names for safety
+                df.columns = df.columns.str.strip()
+
+                # Debugging: Print column names before processing orders
+                print(
+                    f"Processing orders from sheet '{sheet_name}' with columns: {df.columns.tolist()}"
+                )
+
+                # Rename the relevant columns for the `order` table
+                df.rename(
+                    columns={
+                        "Date_Commande": "order_date",
+                        "Montant_Total": "total_amount",
+                    },
+                    inplace=True,
+                )
+
+                # Use a connection to fetch `email-to-client_id` mapping
+                with engine.connect() as connection:
+                    result = connection.execute(
+                        text("SELECT email, client_id FROM client")
+                    )
+                    email_to_client_id_df = pd.DataFrame(
+                        result.fetchall(), columns=["email", "client_id"]
+                    )
+
+                # Convert the DataFrame to a dictionary for fast lookup
+                email_to_client_id = dict(email_to_client_id_df.values)
+
+                # Map `client_id` to each order based on `email`
+                df["client_id"] = df["email"].map(email_to_client_id)
+
+                # Debugging: Check for unmatched emails
+                if df["client_id"].isna().any():
+                    print("Unmapped emails found in orders:")
+                    print(
+                        df[df["client_id"].isna()][
+                            ["email", "order_date", "total_amount"]
+                        ]
+                    )
+
+                # Drop rows with missing `order_date`, `total_amount`, or `client_id`
+                initial_row_count = len(df)
+                df = df.dropna(subset=["client_id", "order_date", "total_amount"])
+                final_row_count = len(df)
+
+                # Debugging: Show how many rows were dropped
+                print(
+                    f"Dropped {initial_row_count - final_row_count} rows due to missing data in 'client_id', 'order_date', or 'total_amount'."
+                )
+
+                # Select only order-related columns
+                order_columns = ["client_id", "order_date", "total_amount"]
+
+                # Check if required columns exist
+                if all(col in df.columns for col in order_columns):
+                    # Write data to the `order` table
+                    df[order_columns].to_sql(
+                        "order", con=engine, if_exists="append", index=False
+                    )
+                    print(
+                        f"Successfully populated `order` table from sheet '{sheet_name}'."
+                    )
+                else:
+                    missing_cols = [
+                        col for col in order_columns if col not in df.columns
+                    ]
+                    print(
+                        f"Missing columns for orders in sheet '{sheet_name}': {missing_cols}"
+                    )
+                    raise ValueError(f"Missing columns: {missing_cols}")
+
+        ### Populate `supplier` table
+        if "fournisseur" in data:
+            supplier_df = data["fournisseur"]
+            supplier_df.rename(
+                columns={
+                    "Nom": "name",
+                    "Email": "email",
+                    "Téléphone": "phone",
+                    "Adresse": "address",
+                },
+                inplace=True,
+            )
+            supplier_df.to_sql("supplier", con=engine, if_exists="append", index=False)
+
+        print("Populated database successfully.")
+
+    except Exception as e:
+        print(f"An error occurred while populating the database: {e}")
 
 
 def main():
     # Database URL (SQLite)
     database_url = "sqlite:///restaurant.db"
 
-    # Paths to the SQL scripts and Excel file
-    up_script_path = "up.sql"  # SQL script to create the schema
-    excel_file_path = (
-        "restaurant_data.xlsx"  # Excel file with the data to populate the tables
-    )
+    # Paths to the SQL schema and Excel file
+    up_script_path = "up.sql"
+    excel_file_path = "restaurant_data.xlsx"
 
     # Step 1: Initialize the database
     initialize_database(database_url, up_script_path)
 
-    # Step 2: Populate the database
+    # Step 2: Populate the database with data
     populate_database(database_url, excel_file_path)
 
 
