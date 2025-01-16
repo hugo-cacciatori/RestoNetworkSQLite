@@ -279,7 +279,7 @@ def populate_database(database_url: str, excel_file_path: str):
                 if all(col in df.columns for col in order_columns):
                     # Write data to the `order` table
                     df[order_columns].to_sql(
-                        "order", con=engine, if_exists="append", index=False
+                        "orders", con=engine, if_exists="append", index=False
                     )
                     print(
                         f"Successfully populated `order` table from sheet '{sheet_name}'."
@@ -306,6 +306,53 @@ def populate_database(database_url: str, excel_file_path: str):
                 inplace=True,
             )
             supplier_df.to_sql("supplier", con=engine, if_exists="append", index=False)
+        
+        ### Populate `delivery` table
+        # Iterate over all sheets that start with "stocks_"
+        for sheet_name in data.keys():
+            if sheet_name.startswith("stocks_"):
+                # Extract the restaurant name from the sheet name
+                restaurant_name = sheet_name.replace("stocks_", "").strip().replace("_", " ").title()
+
+                # Get `restaurant_id` for the current restaurant
+                restaurant_id = get_restaurant_id(engine, restaurant_name)
+                if not restaurant_id:
+                    print(f"Skipping sheet '{sheet_name}' because restaurant '{restaurant_name}' was not found in the database.")
+                    continue
+
+                # Load the stock data from the current sheet
+                stock_df = data[sheet_name]
+
+                # Debugging: Print columns in the stock sheet
+                print(f"Processing sheet '{sheet_name}' with columns: {stock_df.columns.tolist()}")
+
+                # Rename columns to match the `delivery` table schema
+                stock_df.rename(
+                    columns={
+                        "Nom_Produit": "product_name",
+                        "Quantité": "quantity",
+                        "Date_Livraison": "delivery_date",
+                    },
+                    inplace=True,
+                )
+
+                # Add the `restaurant_id` column to associate deliveries with restaurants
+                stock_df["restaurant_id"] = restaurant_id
+
+                # Define the required columns for the `delivery` table
+                delivery_columns = ["restaurant_id", "product_name", "quantity", "delivery_date"]
+
+                # Ensure all required columns are present
+                if all(col in stock_df.columns for col in delivery_columns):
+                    # Insert data into the `delivery` table
+                    stock_df[delivery_columns].to_sql(
+                        "delivery", con=engine, if_exists="append", index=False
+                    )
+                    print(f"Successfully populated `delivery` table from sheet '{sheet_name}'.")
+                else:
+                    missing_cols = [col for col in delivery_columns if col not in stock_df.columns]
+                    print(f"Missing required columns in sheet '{sheet_name}': {missing_cols}")
+                    raise ValueError(f"Missing columns: {missing_cols}")
 
         print("Populated database successfully.")
 
@@ -326,7 +373,6 @@ def main():
 
     # Step 2: Populate the database with data
     populate_database(database_url, excel_file_path)
-
 
 if __name__ == "__main__":
     main()

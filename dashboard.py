@@ -1,97 +1,128 @@
-import dash
-from dash import dcc, html
-from dash.dependencies import Input, Output
+import sqlite3
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from dash import dcc, html
+from dash.dependencies import Input, Output
+import dash
 
-# Sample Orders Data to simulate "last orders" dataset (replace with actual file parsing)
-orders_data = pd.DataFrame(
-    {
-        "Client": ["Alice", "Bob", "Charlie", "Diana", "Eve"],
-        "Date_Commande": [
-            "2024-11-01",
-            "2024-11-03",
-            "2024-11-01",
-            "2024-11-05",
-            "2024-11-04",
-        ],
-        "Montant_Total (€)": [45.5, 80.0, 30.0, 60.0, 75.0],
-    }
+# Database connection (replace 'restaurant_data.db' with the actual path to your SQLite database)
+DATABASE_PATH = "restaurant.db"
+
+def fetch_data_from_db(query, params=None):
+    """Helper function to fetch data from SQLite database."""
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        if params:
+            return pd.read_sql_query(query, conn, params=params)
+        return pd.read_sql_query(query, conn)
+
+# Fetch Data From SQLite Database and Populate DataFrames
+# 1. Last Orders Data
+orders_query = """
+    SELECT 
+        client.first_name || ' ' || client.last_name AS Client,
+        "orders".order_date AS Date_Commande,
+        "orders".total_amount AS Montant_Total
+    FROM
+        "orders"
+    JOIN
+        client
+    ON 
+        "orders".client_id = client.client_id
+    ORDER BY 
+        "orders".order_date DESC
+"""
+
+orders_data = fetch_data_from_db(orders_query)
+
+# 2. Inventory Data
+inventory_query = """
+    SELECT 
+        delivery.product_name AS Nom_Produit,
+        delivery.quantity AS Quantité,
+        delivery.delivery_date AS Date_Livraison
+    FROM 
+        delivery
+"""
+inventory_data = fetch_data_from_db(inventory_query)
+
+# 3. Employee Data
+employee_query = """
+    SELECT
+        employee.position AS Poste,
+        COUNT(employee.employee_id) AS Count,
+        AVG(employee.salary) AS Average_Salary,
+        restaurant.name AS Restaurant
+    FROM
+        employee
+    JOIN
+        restaurant
+    ON
+        employee.restaurant_id = restaurant.restaurant_id
+    GROUP BY
+        employee.position, restaurant.name
+"""
+employee_data = fetch_data_from_db(employee_query)
+
+employee_distribution_query = """
+    SELECT
+        restaurant.name AS Restaurant,
+        COUNT(employee.employee_id) AS Employee_Count
+    FROM
+        employee
+    JOIN
+        restaurant
+    ON
+        employee.restaurant_id = restaurant.restaurant_id
+    GROUP BY
+        restaurant.name
+"""
+restaurant_employee_distribution = fetch_data_from_db(employee_distribution_query)
+restaurant_employee_distribution_dict = dict(
+    zip(restaurant_employee_distribution["Restaurant"], restaurant_employee_distribution["Employee_Count"])
 )
 
-# Inventory Data (no changes)
-inventory_data = pd.DataFrame(
-    {
-        "Nom_Produit": [
-            "Tomates",
-            "Pâtes",
-            "Beurre",
-            "Oeufs",
-            "Farine",
-            "Poisson",
-            "Sel",
-        ],
-        "Quantité": [38, 112, 30, 95, 67, 131, 180],
-        "Date_Livraison": ["2024-12-10"] * 7,
-    }
-)
+# 4. Menu Data
+menu_query = """
+    SELECT
+        dish.name AS Nom,
+        dish.price AS Prix
+    FROM 
+        dish
+"""
+menu_data = fetch_data_from_db(menu_query)
 
-# Employee Data (no changes)
-employee_data = pd.DataFrame(
-    {
-        "Poste": ["Serveur", "Cuisinier", "Plongeur", "Responsable"],
-        "Count": [5, 4, 3, 4],
-        "Average_Salary": [1720, 2060, 1650, 2650],
-        "Restaurant": ["Chez Martin", "Le Gourmet", "La Bonne Table", "Chez Martin"],
-    }
-)
-
-# Menu Data (no changes)
-menu_data = pd.DataFrame(
-    {
-        "Nom": ["Burger Gourmet", "Salade César", "Pizza Margherita", "Poulet Curry"],
-        "Prix (€)": [10, 13.54, 15.32, 18.68],
-    }
-)
-
-restaurant_employee_distribution = {
-    "Le Gourmet": 6,
-    "Chez Martin": 8,
-    "La Bonne Table": 7,
-}
-
-# Initialize Dash app
+# Initialize Dash App
 app = dash.Dash(__name__)
 
 # Layout
 app.layout = html.Div(
     [
         html.H1("Restaurant Insights Dashboard", style={"textAlign": "center"}),
-        # Bar Chart for last orders
+
+        # Bar Chart for Last Orders
         html.Div(
             [
                 html.H3("Recent Orders and Total Amount"),
                 dcc.Graph(
                     id="recent-orders-bar-chart",
                     figure=px.bar(
-                        orders_data.sort_values("Date_Commande", ascending=False),
+                        orders_data,
                         x="Client",
-                        y="Montant_Total (€)",
+                        y="Montant_Total",
                         color="Date_Commande",
                         title="Recent Orders and Total Amount",
                         labels={
-                            "Montant_Total (€)": "Total Amount (€)",
+                            "Montant_Total": "Total Amount (€)",
                             "Client": "Client",
                             "Date_Commande": "Order Date",
                         },
-                    ).update_layout(
-                        xaxis_type="category"
-                    ),  # Ensure x-axis is categorical
+                    ).update_layout(xaxis_type="category"),
                 ),
             ]
         ),
-        # Pie Chart for revenue distribution
+
+        # Pie Chart for Revenue Distribution
         html.Div(
             [
                 html.H3("Revenue Distribution by Food Item"),
@@ -100,13 +131,14 @@ app.layout = html.Div(
                     figure=px.pie(
                         menu_data,
                         names="Nom",
-                        values="Prix (€)",
+                        values="Prix",
                         title="Revenue Distribution by Food Item",
                     ),
                 ),
             ]
         ),
-        # Donut Chart for employee distribution
+
+        # Donut Chart for Employee Distribution
         html.Div(
             [
                 html.H3("Employee Distribution by Restaurant"),
@@ -114,15 +146,16 @@ app.layout = html.Div(
                     id="employee-donut-chart",
                     figure=go.Figure(
                         go.Pie(
-                            labels=list(restaurant_employee_distribution.keys()),
-                            values=list(restaurant_employee_distribution.values()),
-                            hole=0.5,  # Turns it into a donut chart
+                            labels=list(restaurant_employee_distribution_dict.keys()),
+                            values=list(restaurant_employee_distribution_dict.values()),
+                            hole=0.5,
                         )
                     ).update_layout(title_text="Employee Distribution by Restaurant"),
                 ),
             ]
         ),
-        # Bar Chart for inventory levels
+
+        # Bar Chart for Inventory Levels
         html.Div(
             [
                 html.H3("Inventory Stock Levels"),
@@ -139,7 +172,8 @@ app.layout = html.Div(
                 ),
             ]
         ),
-        # Bar Chart for employee count by role
+
+        # Bar Chart for Employee Count by Role
         html.Div(
             [
                 html.H3("Employee Count by Role"),
@@ -156,7 +190,8 @@ app.layout = html.Div(
                 ),
             ]
         ),
-        # Bar Chart for average salary by role
+
+        # Bar Chart for Average Salary by Role
         html.Div(
             [
                 html.H3("Average Salary by Role"),
@@ -176,6 +211,6 @@ app.layout = html.Div(
     ]
 )
 
-# Run the app
+# Run the App
 if __name__ == "__main__":
     app.run_server(debug=True)
